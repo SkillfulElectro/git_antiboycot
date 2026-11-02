@@ -1,0 +1,49 @@
+name: Ephemeral VPN
+
+# Deliberately manual-only. Never expose this server on push or pull_request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Do not cancel an in-use VPN when another run is dispatched. GitHub keeps at
+# most one running and one pending run for this group.
+concurrency:
+  group: ephemeral-vpn-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  vpn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Python dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+
+      - name: Install verified server binaries
+        run: python -m vpn_server.install --directory "$RUNNER_TEMP/antiboycot-bin"
+
+      - name: Serve VPN until cancelled or idle
+        env:
+          TG_BASE_URL: ${{ secrets.TG_BASE_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_USERNAME: ${{ secrets.TG_CHANNEL_USERNAME }}
+        run: |
+          python -m vpn_server \
+            --xray "$RUNNER_TEMP/antiboycot-bin/xray" \
+            --cloudflared "$RUNNER_TEMP/antiboycot-bin/cloudflared"
+
+      - name: Remove downloaded binaries
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/antiboycot-bin"
