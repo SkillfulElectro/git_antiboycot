@@ -154,6 +154,11 @@ PIP_ONLY_BINARY=':all:' pip-compile --generate-hashes --no-header \
 - **Telegram permission error:** confirm the bot is a channel administrator allowed
   to post, and the channel username/ID belongs to that channel.
 - **Custom API error:** check the API root and proxy prefix; do not append the token.
+- **Legacy proxy `TypeError`:** channel preflight reads `getChat`/`getChatMember` as
+  raw JSON so older proxies that omit newer PTB model fields can still work. If
+  delivery still reports a response that PTB could not decode, update the proxy or
+  use `https://api.telegram.org`. Unexpected-error logs include module/function/line
+  locations, but not exception text, request URLs, or local values.
 - **Tunnel startup timeout:** retry later and check whether the runner/network can
   reach Cloudflare. No Cloudflare account token is needed for this quick-tunnel mode.
 - **Configuration delivery fails:** the job stops its children and exits unsuccessfully;

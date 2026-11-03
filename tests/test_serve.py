@@ -120,6 +120,20 @@ async def test_delivery_failure_never_leaves_server_running(mocked_runtime, monk
     assert list(mocked_runtime.glob("antiboycot-*")) == []
 
 
+async def test_unexpected_error_logs_safe_location(mocked_runtime, monkeypatch, capsys):
+    async def failing_enter(self):
+        raise TypeError(os.environ["TG_BOT_TOKEN"])
+
+    monkeypatch.setattr(FakeNotifier, "__aenter__", failing_enter)
+    assert await serve(mocked_runtime / "xray", mocked_runtime / "cloudflared") == 1
+    output = capsys.readouterr().out
+    assert "Unexpected TypeError at" in output
+    assert "failing_enter" in output
+    assert "details withheld to protect secrets" in output
+    assert os.environ["TG_BOT_TOKEN"] not in output
+    assert FakeProcess.instances == []
+
+
 async def test_sigterm_stops_session_and_removes_config(mocked_runtime, monkeypatch):
     started = asyncio.Event()
 

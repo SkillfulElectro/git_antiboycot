@@ -6,6 +6,7 @@ import asyncio
 import html
 import io
 import logging
+import warnings
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import TypeVar
@@ -15,6 +16,7 @@ from qrcode.image.pure import PyPNGImage
 from telegram import Bot, LinkPreviewOptions
 from telegram.error import RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
+from telegram.warnings import PTBUserWarning
 
 from .config import TelegramSettings, run_url
 
@@ -72,12 +74,30 @@ class Notifier:
 
     async def __aenter__(self) -> Notifier:
         try:
-            await self.bot.initialize()
-            me = await self._call(self.bot.get_me)
-            chat = await self._call(lambda: self.bot.get_chat(self.channel))
-            member = await self._call(lambda: self.bot.get_chat_member(chat.id, me.id))
-            if member.status not in {"administrator", "creator"} or (
-                chat.type == "channel" and getattr(member, "can_post_messages", None) is False
+            await self._call(self.bot.initialize)
+            # Older Bot API servers/proxies often omit newer ChatFullInfo and
+            # ChatMemberAdministrator fields that PTB's typed wrappers require.
+            # Preflight only needs a few stable fields, so read raw JSON instead
+            # of failing on unrelated schema additions.
+            chat = await self._call(lambda: self._raw_api("getChat", {"chat_id": self.channel}))
+            chat_id = chat.get("id")
+            chat_type = chat.get("type")
+            if (
+                not isinstance(chat_id, int)
+                or isinstance(chat_id, bool)
+                or not isinstance(chat_type, str)
+            ):
+                raise TelegramDeliveryError(
+                    "Telegram getChat returned an invalid channel identity."
+                )
+            member = await self._call(
+                lambda: self._raw_api("getChatMember", {"chat_id": chat_id, "user_id": self.bot.id})
+            )
+            status = member.get("status")
+            if (
+                not isinstance(status, str)
+                or status not in {"administrator", "creator"}
+                or (chat_type == "channel" and member.get("can_post_messages") is False)
             ):
                 raise TelegramDeliveryError(
                     "The bot must be a channel administrator with permission to post messages."
@@ -89,6 +109,17 @@ class Notifier:
 
     async def __aexit__(self, *_: object) -> None:
         await self.bot.shutdown()
+
+    async def _raw_api(self, endpoint: str, parameters: dict[str, object]) -> dict:
+        # do_api_request() is PTB's public raw-response escape hatch. It warns
+        # when a typed wrapper exists; that warning is expected here because the
+        # wrapper is exactly what rejects legacy proxy payloads.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r"Please use 'Bot\.", category=PTBUserWarning)
+            result = await self.bot.do_api_request(endpoint, parameters)
+        if not isinstance(result, dict):
+            raise TelegramDeliveryError(f"Telegram {endpoint} returned an unexpected response.")
+        return result
 
     async def _call(self, operation: Callable[[], Awaitable[T]]) -> T:
         for attempt in range(3):
@@ -104,6 +135,15 @@ class Notifier:
                 if attempt == 2 or delay > 30:
                     break
                 await asyncio.sleep(delay + 1)
+            except TypeError as exc:
+                # PTB raises TypeError when a proxy returns a payload that its
+                # typed models cannot deserialize. Do not retry or echo the
+                # exception text, which can contain request/response values.
+                raise TelegramDeliveryError(
+                    f"Telegram returned a response that python-telegram-bot could not "
+                    f"decode ({type(exc).__name__}). Check that TG_BASE_URL points to a "
+                    "compatible Bot API endpoint."
+                ) from None
             except TelegramError as exc:
                 # Do not render exception text: Bot API/proxy errors can echo a
                 # request URL containing the token, or the channel/configuration.

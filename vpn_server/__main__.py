@@ -26,6 +26,18 @@ from .runtime import (
 from .telegram import Notifier, TelegramDeliveryError
 
 
+def _safe_exception_location(exc: BaseException) -> str:
+    """Return module/function/line frames without exception text or local values."""
+    frames = []
+    traceback = exc.__traceback__
+    while traceback is not None and len(frames) < 8:
+        frame = traceback.tb_frame
+        module = frame.f_globals.get("__name__", "<unknown>")
+        frames.append(f"{module}.{frame.f_code.co_name}:{traceback.tb_lineno}")
+        traceback = traceback.tb_next
+    return " -> ".join(reversed(frames)) if frames else "<unknown>"
+
+
 async def serve(xray: Path, cloudflared: Path) -> int:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -43,6 +55,7 @@ async def serve(xray: Path, cloudflared: Path) -> int:
                 loop.add_signal_handler(sig, stop.set)
                 installed_signals.append(sig)
 
+        print("Verifying Telegram bot and channel access.", flush=True)
         async with Notifier(settings, os.environ.copy()) as notifier:
             print("Telegram bot and channel access verified.", flush=True)
             # Sensitive files live outside the checkout. Stop children before
@@ -140,8 +153,10 @@ async def serve(xray: Path, cloudflared: Path) -> int:
     except Exception as exc:
         # Library exceptions may embed request URLs or credentials. Do not log
         # their text or a traceback containing local configuration values.
+        location = _safe_exception_location(exc)
         print(
-            f"::error::Unexpected {type(exc).__name__}; details withheld to protect secrets.",
+            f"::error::Unexpected {type(exc).__name__} at {location}; "
+            "details withheld to protect secrets.",
             flush=True,
         )
         return 1
