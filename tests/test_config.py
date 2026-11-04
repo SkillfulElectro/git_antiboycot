@@ -1,5 +1,4 @@
 import ipaddress
-import json
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -7,7 +6,8 @@ import pytest
 from vpn_server.config import (
     BLOCKED_IPS,
     IDLE_TIMEOUT_SECONDS,
-    MAX_USERS,
+    STATS_PREFIX,
+    USER_EMAIL,
     ConfigurationError,
     TelegramSettings,
     VpnConfig,
@@ -15,9 +15,8 @@ from vpn_server.config import (
     run_url,
     share_link,
     validate_channel,
-    validate_transport,
     validate_tunnel_host,
-    validate_users,
+    xray_client_config,
     xray_config,
 )
 
@@ -91,45 +90,19 @@ def test_invalid_channels(channel):
         validate_channel(channel)
 
 
-@pytest.mark.parametrize(("value", "expected"), [("1", 1), ("5", 5), (20, 20)])
-def test_valid_user_counts(value, expected):
-    assert validate_users(value) == expected
-
-
-@pytest.mark.parametrize("value", ["0", "21", "-1", "abc", "1.5", True, None])
-def test_invalid_user_counts(value):
-    with pytest.raises(ConfigurationError):
-        validate_users(value)
-
-
-@pytest.mark.parametrize(("value", "expected"), [("xhttp", "xhttp"), ("WS", "ws")])
-def test_valid_transports(value, expected):
-    assert validate_transport(value) == expected
-
-
-@pytest.mark.parametrize("value", ["grpc", "tcp", "", "reality"])
-def test_invalid_transports(value):
-    with pytest.raises(ConfigurationError):
-        validate_transport(value)
-
-
 def test_idle_timeout_is_five_minutes():
     assert IDLE_TIMEOUT_SECONDS == 300
 
 
-def test_xray_config_is_loopback_only_multi_user_and_metered():
-    config = VpnConfig.create((21001, 21002, 21003), users=3)
+def test_xray_config_has_one_shared_account_and_loopback_only_listeners():
+    config = VpnConfig.create((21001, 21002, 21003))
     data = xray_config(config)
     assert all(inbound["listen"] == "127.0.0.1" for inbound in data["inbounds"])
     vpn, api = data["inbounds"]
     assert vpn["protocol"] == "vless"
     clients = vpn["settings"]["clients"]
-    assert len(clients) == 3
-    assert len({client["id"] for client in clients}) == 3
-    assert len({client["email"] for client in clients}) == 3
-    assert vpn["streamSettings"]["network"] == "xhttp"
-    assert vpn["streamSettings"]["xhttpSettings"]["path"] == config.path
-    assert vpn["streamSettings"]["xhttpSettings"]["mode"] == "auto"
+    assert clients == [{"id": config.client_id, "email": USER_EMAIL, "level": 0}]
+    assert vpn["settings"]["decryption"] == "none"
     assert api["protocol"] == "dokodemo-door"
     assert data["api"]["services"] == ["StatsService"]
     assert data["routing"]["rules"][0]["outboundTag"] == "api"
@@ -138,19 +111,73 @@ def test_xray_config_is_loopback_only_multi_user_and_metered():
     assert data["policy"]["levels"]["0"]["connIdle"] == 300
     assert data["policy"]["levels"]["0"]["bufferSize"] == 1024
     assert config.client_id not in repr(config)
-    assert config.path not in repr(config)
-    assert len(config.stats_prefixes) == 3
+    assert config.ws_path not in repr(config)
+    assert STATS_PREFIX == f"user>>>{USER_EMAIL}>>>traffic>>>"
 
 
-def test_ws_fallback_uses_early_data():
-    config = VpnConfig.create((21001, 21002, 21003), users=1, transport="ws")
-    data = xray_config(config)
-    stream = data["inbounds"][0]["streamSettings"]
-    assert stream["network"] == "ws"
-    assert stream["wsSettings"]["maxEarlyData"] == 2048
+def test_server_uses_previous_working_plain_websocket_path():
+    config = VpnConfig.create((21001, 21002, 21003))
+    stream = xray_config(config)["inbounds"][0]["streamSettings"]
+    assert stream == {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {"path": config.ws_path},
+    }
+
+
+def test_share_link_matches_previous_working_websocket_format():
+    config = VpnConfig.create((21001, 21002, 21003))
     link = share_link(config, "test-tunnel.trycloudflare.com")
-    query = parse_qs(urlsplit(link).query)
-    assert query["path"] == [config.path + "?ed=2048"]
+    parsed = urlsplit(link)
+    query = parse_qs(parsed.query)
+    assert parsed.scheme == "vless"
+    assert parsed.username == config.client_id
+    assert parsed.hostname == "test-tunnel.trycloudflare.com"
+    assert parsed.port == 443
+    assert query == {
+        "type": ["ws"],
+        "security": ["tls"],
+        "encryption": ["none"],
+        "sni": [parsed.hostname],
+        "host": [parsed.hostname],
+        "path": [config.ws_path],
+        "fp": ["chrome"],
+        "alpn": ["http/1.1"],
+    }
+    assert "allowInsecure" not in query
+    assert "ed" not in query
+    assert "extra" not in query
+    assert parsed.fragment.startswith("node-")
+    assert "vpn" not in parsed.fragment.lower()
+    assert "antiboycot" not in link.lower()
+
+
+def test_probe_client_mirrors_the_published_link():
+    config = VpnConfig.create((21001, 21002, 21003))
+    host = "test-tunnel.trycloudflare.com"
+    link = urlsplit(share_link(config, host))
+    query = parse_qs(link.query)
+    client = xray_client_config(config, host, 28080)
+    inbound = client["inbounds"][0]
+    assert inbound["listen"] == "127.0.0.1"
+    assert inbound["port"] == 28080
+    assert inbound["protocol"] == "http"
+    outbound = client["outbounds"][0]
+    assert outbound["protocol"] == "vless"
+    server = outbound["settings"]["vnext"][0]
+    assert server["address"] == link.hostname
+    assert server["port"] == link.port
+    assert server["users"] == [{"id": config.client_id, "encryption": "none", "level": 0}]
+    stream = outbound["streamSettings"]
+    assert stream["network"] == query["type"][0]
+    assert stream["security"] == query["security"][0]
+    assert stream["tlsSettings"]["serverName"] == query["sni"][0]
+    assert stream["tlsSettings"]["allowInsecure"] is False
+    assert stream["tlsSettings"]["fingerprint"] == query["fp"][0]
+    assert stream["tlsSettings"]["alpn"] == query["alpn"]
+    assert stream["wsSettings"]["path"] == query["path"][0]
+    assert stream["wsSettings"]["headers"]["Host"] == query["host"][0]
+    assert "mux" not in outbound
 
 
 @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fc00::1"])
@@ -162,39 +189,6 @@ def test_private_addresses_blocked_after_dns_resolution(address):
     assert freedom["settings"]["finalRules"][0]["action"] == "block"
     assert freedom["streamSettings"]["sockopt"]["tcpFastOpen"] is True
     assert freedom["streamSettings"]["sockopt"]["tcpNoDelay"] is True
-
-
-def test_xhttp_share_link_is_v2rayng_compatible_and_neutral():
-    config = VpnConfig.create((21001, 21002, 21003), users=2)
-    link = share_link(config, "test-tunnel.trycloudflare.com", index=1)
-    parsed = urlsplit(link)
-    query = parse_qs(parsed.query)
-    assert parsed.scheme == "vless"
-    assert parsed.username == config.clients[1].client_id
-    assert parsed.hostname == "test-tunnel.trycloudflare.com"
-    assert parsed.port == 443
-    assert query["type"] == ["xhttp"]
-    assert query["security"] == ["tls"]
-    assert query["encryption"] == ["none"]
-    assert query["sni"] == [parsed.hostname]
-    assert query["host"] == [parsed.hostname]
-    assert query["path"] == [config.path]
-    assert query["mode"] == ["packet-up"]
-    assert query["alpn"] == ["h2"]
-    assert query["fp"] == ["chrome"]
-    assert "allowInsecure" not in query
-    extra = json.loads(query["extra"][0])
-    assert extra["xmux"]["maxConcurrency"] == "16-32"
-    assert extra["xPaddingBytes"] == "100-1000"
-    assert parsed.fragment.startswith("node-")
-    assert "vpn" not in parsed.fragment.lower()
-    assert "antiboycot" not in link.lower()
-
-
-def test_share_link_index_bounds():
-    config = VpnConfig.create((21001, 21002, 21003), users=1)
-    with pytest.raises(ConfigurationError):
-        share_link(config, "test-tunnel.trycloudflare.com", index=1)
 
 
 @pytest.mark.parametrize(
@@ -212,12 +206,11 @@ def test_reject_untrusted_tunnel_host(host):
 
 
 def test_each_session_gets_new_credentials():
-    first = VpnConfig.create((21001, 21002, 21003), users=MAX_USERS)
-    second = VpnConfig.create((21001, 21002, 21003), users=MAX_USERS)
+    first = VpnConfig.create((21001, 21002, 21003))
+    second = VpnConfig.create((21001, 21002, 21003))
     assert first.client_id != second.client_id
-    assert first.path != second.path
-    assert first.path.startswith("/") and " " not in first.path
-    assert len({client.client_id for client in first.clients}) == MAX_USERS
+    assert first.ws_path != second.ws_path
+    assert first.ws_path.startswith("/") and " " not in first.ws_path
 
 
 def test_run_url():

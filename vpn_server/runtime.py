@@ -16,15 +16,17 @@ import time
 import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
 
 from .config import (
     IDLE_TIMEOUT_SECONDS,
     POLL_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
+    STATS_PREFIX,
     VpnConfig,
     validate_tunnel_host,
+    xray_client_config,
 )
 
 
@@ -76,12 +78,12 @@ def parse_tunnel_metrics(text: str) -> TunnelMetrics:
     )
 
 
-def parse_traffic(text: str, allowed_prefixes: frozenset[str]) -> int:
+def parse_traffic(text: str) -> int:
     # Xray's protobuf JSON can encode int64 values as either strings or numbers.
     data = json.loads(text or "{}")
     if not isinstance(data, dict):
         raise ValueError("Invalid Xray stats response.")
-    allowed = {prefix + suffix for prefix in allowed_prefixes for suffix in ("uplink", "downlink")}
+    allowed = {STATS_PREFIX + "uplink", STATS_PREFIX + "downlink"}
     total = 0
     for stat in data.get("stat", []):
         if not isinstance(stat, dict) or stat.get("name") not in allowed:
@@ -96,16 +98,18 @@ def parse_traffic(text: str, allowed_prefixes: frozenset[str]) -> int:
     return total
 
 
-def allocate_ports() -> tuple[int, int, int]:
-    """Hold all reservations together so the three ports cannot collide."""
+def allocate_ports(count: int = 3) -> tuple[int, ...]:
+    """Hold all reservations together so the requested ports cannot collide."""
+    if count < 1:
+        raise ValueError("At least one port is required.")
     with contextlib.ExitStack() as stack:
         sockets = []
-        for _ in range(3):
+        for _ in range(count):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             stack.enter_context(sock)
             sock.bind(("127.0.0.1", 0))
             sockets.append(sock)
-        return tuple(sock.getsockname()[1] for sock in sockets)  # type: ignore[return-value]
+        return tuple(sock.getsockname()[1] for sock in sockets)
 
 
 def child_environment(home: Path) -> dict[str, str]:
@@ -190,13 +194,13 @@ async def local_get(port: int, path: str) -> bytes:
     return await asyncio.to_thread(get)
 
 
-async def query_traffic(xray: Path, port: int, config: VpnConfig) -> int:
+async def query_traffic(xray: Path, port: int) -> int:
     process = await asyncio.create_subprocess_exec(
         str(xray),
         "api",
         "statsquery",
         f"--server=127.0.0.1:{port}",
-        "--pattern=user>>>",
+        f"--pattern={STATS_PREFIX}",
         "--reset",
         "--timeout=3",
         env=child_environment(xray.parent),
@@ -213,7 +217,7 @@ async def query_traffic(xray: Path, port: int, config: VpnConfig) -> int:
     if process.returncode != 0:
         raise ServerError("Xray statistics API is unavailable.")
     try:
-        return parse_traffic(stdout.decode(), config.stats_prefixes)
+        return parse_traffic(stdout.decode())
     except (ValueError, UnicodeError):
         raise ServerError("Xray returned invalid statistics.") from None
 
@@ -255,7 +259,7 @@ async def wait_for_tunnel(
             await local_get(config.metrics_port, "/ready")
             data = json.loads(await local_get(config.metrics_port, "/quicktunnel"))
             host = validate_tunnel_host(data.get("hostname", ""))
-            if await asyncio.to_thread(probe_transport, host, config):
+            if await asyncio.to_thread(probe_websocket, host, config.ws_path):
                 return host
         except (OSError, ValueError, TypeError, AttributeError):
             pass
@@ -264,39 +268,6 @@ async def wait_for_tunnel(
         "Cloudflare quick tunnel did not become reachable within 150 seconds. "
         "Try again later; quick tunnels are best-effort and need outbound access to Cloudflare."
     )
-
-
-def probe_transport(host: str, config: VpnConfig) -> bool:
-    if config.transport == "xhttp":
-        return probe_xhttp(host, config.path)
-    return probe_websocket(host, config.path)
-
-
-def probe_xhttp(host: str, path: str) -> bool:
-    """Verify the public XHTTP route with a CORS preflight, without a credential.
-
-    Xray's XHTTP handler validates padding before answering OPTIONS. A real
-    browser preflight carries Access-Control-Request-Method and returns 200.
-    """
-    connection = HTTPSConnection(host, 443, timeout=8)
-    padding = "X" * 256
-    normalized_path = path.rstrip("/") + "/"
-    try:
-        connection.request(
-            "OPTIONS",
-            normalized_path,
-            headers={
-                "Host": host,
-                "Origin": f"https://{host}",
-                "Access-Control-Request-Method": "POST",
-                "Referer": f"https://{host}{normalized_path}?x_padding={padding}",
-            },
-        )
-        return connection.getresponse().status == 200
-    except (OSError, ValueError):
-        return False
-    finally:
-        connection.close()
 
 
 def probe_websocket(host: str, path: str) -> bool:
@@ -321,22 +292,68 @@ def probe_websocket(host: str, path: str) -> bool:
         connection.close()
 
 
-def probe_local_websocket(port: int, path: str) -> bool:
-    connection = HTTPConnection("127.0.0.1", port, timeout=5)
+def probe_http_via_proxy(proxy_port: int) -> bool:
+    """Request a standard 204 endpoint through the temporary local Xray client."""
+    connection = HTTPSConnection("127.0.0.1", proxy_port, timeout=15)
+    connection.set_tunnel("www.gstatic.com", 443)
     try:
         connection.request(
             "GET",
-            path,
-            headers={
-                "Connection": "Upgrade",
-                "Upgrade": "websocket",
-                "Sec-WebSocket-Version": "13",
-                "Sec-WebSocket-Key": base64.b64encode(secrets.token_bytes(16)).decode(),
-            },
+            "/generate_204",
+            headers={"Host": "www.gstatic.com", "User-Agent": "Mozilla/5.0"},
         )
-        return connection.getresponse().status == 101
+        response = connection.getresponse()
+        response.read()
+        return response.status == 204
+    except (OSError, ValueError, HTTPException):
+        return False
     finally:
         connection.close()
+
+
+async def verify_shared_config(
+    xray: Path,
+    config: VpnConfig,
+    host: str,
+    directory: Path,
+    stop: asyncio.Event | None = None,
+    *,
+    max_seconds: float = 30,
+) -> None:
+    """Prove the exact shared link works for two simultaneous devices.
+
+    A temporary Xray client uses the same UUID, WebSocket path, TLS/SNI/Host and
+    ALPN as the published link. Two concurrent HTTPS requests must both return
+    204 through the public tunnel before any config is sent to Telegram.
+    """
+    proxy_port = allocate_ports(1)[0]
+    client_path = directory / "xray-probe-client.json"
+    fd = os.open(client_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as output:
+        json.dump(xray_client_config(config, host, proxy_port), output)
+    process = await ManagedProcess.start(
+        "xray-probe-client", [str(xray), "run", "-c", str(client_path)], directory
+    )
+    try:
+        await wait_for_origin(proxy_port, process, stop)
+        deadline = time.monotonic() + max_seconds
+        while time.monotonic() < deadline:
+            if stop is not None and stop.is_set():
+                return
+            process.ensure_running()
+            results = await asyncio.gather(
+                asyncio.to_thread(probe_http_via_proxy, proxy_port),
+                asyncio.to_thread(probe_http_via_proxy, proxy_port),
+                return_exceptions=True,
+            )
+            if all(result is True for result in results):
+                return
+            await asyncio.sleep(2)
+        raise ServerError(
+            "Shared VPN configuration failed end-to-end verification; no config was published."
+        )
+    finally:
+        await process.stop()
 
 
 async def validate_xray(xray: Path, config_path: Path) -> None:

@@ -1,23 +1,31 @@
 # git_antiboycot
 
 An **on-demand, ephemeral VPN proxy** running in a GitHub Actions job. It starts
-[Xray](https://github.com/XTLS/Xray-core) with **VLESS + XHTTP** by default, exposes it
-through a [Cloudflare quick tunnel](https://github.com/cloudflare/cloudflared) over
-**TLS**, and sends **config-only** V2RayNG-importable links to a Telegram channel using
+[Xray](https://github.com/XTLS/Xray-core) with **VLESS + WebSocket + TLS**, exposes it
+through a [Cloudflare quick tunnel](https://github.com/cloudflare/cloudflared), and sends
+**one config-only** V2RayNG-importable link to a Telegram channel using
 [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot).
+
+**One link is shared by multiple users.** Every device imports the same `vless://`
+URI and can connect at the same time. There is no user-count input and no separate
+per-user config.
 
 No Cloudflare account, domain, certificate, or open inbound runner port is required.
 This is a proxy for apps routed by V2RayNG, not a WireGuard/OpenVPN server. UDP can
-be carried inside VLESS/XHTTP; this is not a raw UDP tunnel.
+be carried inside VLESS/WebSocket; this is not a raw UDP tunnel.
 
 ## What changed in this version
 
+- **Restored the previous working WebSocket/TLS link format.** The XHTTP experiment
+  was removed because it did not connect reliably in the reported environment.
+- **One shared config for multiple simultaneous users.** The server has one VLESS
+  UUID; VLESS allows many devices to authenticate with that same UUID concurrently.
+- **End-to-end verification before publishing.** Before sending anything to Telegram,
+  the workflow starts a temporary Xray client with the exact published settings and
+  requires two simultaneous proxied HTTPS requests to succeed through the public tunnel.
 - **Five-minute idle shutdown** instead of one hour.
-- **Multiple independent users** per run, each with its own UUID and config message.
-- **XHTTP packet-up** default transport with padding and XMUX connection reuse; a
-  **WebSocket + early-data** fallback is available from the workflow input.
 - **Neutral profile remarks** and no QR code, captions, or status messages in the
-  channel. Each Telegram message contains exactly one `vless://` URI.
+  channel. The Telegram message contains exactly one `vless://` URI.
 - **Automatic config-message deletion** on idle shutdown, cancellation, runner stop
   signals, and operational failures, plus an independent cleanup job that retries
   deletion from a persisted receipt.
@@ -28,8 +36,8 @@ be carried inside VLESS/XHTTP; this is not a raw UDP tunnel.
 2. Create a **private** Telegram channel and add the bot as an administrator with
    **Post messages** permission. **Delete messages** is recommended for full cleanup;
    Telegram also lets a channel bot with Post messages delete its own outgoing
-   messages. Anyone who can read the channel can use any config posted there while
-   the run is active.
+   messages. Anyone who can read the channel can use the shared config while the run
+   is active.
 3. In the GitHub repository, open **Settings → Secrets and variables → Actions**
    and add these **repository secrets**:
 
@@ -60,14 +68,13 @@ be carried inside VLESS/XHTTP; this is not a raw UDP tunnel.
 
 ## Start, connect, and stop
 
-1. Open **Actions → Ephemeral VPN → Run workflow**.
-2. Choose the number of users (`1`–`20`, default `5`) and transport:
-   - `xhttp` — default, CDN-compatible packet-up mode with padding and XMUX.
-   - `ws` — compatibility fallback using WebSocket early data.
-3. Wait for the Telegram messages. Each message is one config-only `vless://` link.
-   In V2RayNG, use **+ → Import from clipboard** for each user’s link.
-4. Select the imported profile and connect. Profiles use port **443**, TLS
-   certificate verification, and the tunnel hostname for SNI/Host.
+1. Open **Actions → Ephemeral VPN → Run workflow**. There are no inputs.
+2. Wait for the single Telegram message. It is one config-only `vless://` link.
+3. On each device, open V2RayNG and use **+ → Import from clipboard** with that same
+   link. Select the imported profile and connect. Multiple devices can use it at the
+   same time.
+4. Profiles use port **443**, TLS certificate verification, and the tunnel hostname
+   for SNI/Host.
 5. To stop manually, open the running workflow and select **Cancel run**.
 
 The foreground Python supervisor keeps the job alive. It stops when:
@@ -78,22 +85,21 @@ The foreground Python supervisor keeps the job alive. It stops when:
 - Xray, the tunnel, or health monitoring fails.
 
 A connected but quiet client counts as active. Traffic is measured using Xray's
-per-user counters across all users; tunnel keepalives, Telegram requests, and
-metrics do not reset the idle timer. Checks run every 5 seconds, so idle shutdown
-occurs on the first check at or after the deadline. Eight consecutive failed health
-checks also stop the server instead of leaving an unmonitored session running.
+shared-account counters; tunnel keepalives, Telegram requests, and metrics do not
+reset the idle timer. Checks run every 5 seconds, so idle shutdown occurs on the first
+check at or after the deadline. Eight consecutive failed health checks also stop the
+server instead of leaving an unmonitored session running.
 
-Every run generates new UUIDs, a new secret path, and a new tunnel hostname. Old
-profiles stop working when the run ends; delete them and import new profiles after
+Every run generates a new UUID, a new secret path, and a new tunnel hostname. Old
+profiles stop working when the run ends; delete them and import the new profile after
 a restart.
 
 ## Config-message deletion
 
-The bot records each delivered message ID in a non-secret receipt file. On normal
-shutdown it deletes the messages immediately. The workflow also uploads that
-receipt as a short-lived artifact, and a separate `cleanup` job runs with
-`if: always()` to retry deletion if the VPN job was cancelled or failed before it
-could finish cleanup.
+The bot records the delivered message ID in a non-secret receipt file. On normal
+shutdown it deletes the message immediately. The workflow also uploads that receipt
+as a short-lived artifact, and a separate `cleanup` job runs with `if: always()` to
+retry deletion if the VPN job was cancelled or failed before it could finish cleanup.
 
 Deletion is **best effort**, not an absolute guarantee:
 
@@ -108,15 +114,14 @@ start a new run; the old credential is invalid once the runner exits.
 
 ## Speed and blocking resistance
 
-The default XHTTP transport uses:
+The restored WebSocket transport uses the same link shape as the previously working
+version, while keeping safe server-side tuning:
 
-- `packet-up` mode for compatibility with HTTP/1.1 origins behind Cloudflare;
-- HTTP/2 between client and Cloudflare, with `cloudflared --protocol http2`;
-- XMUX connection reuse to reduce per-request latency;
-- 1 MiB Xray per-connection buffers, TCP fast-open/no-delay/keepalive where supported;
-- random secret paths, neutral profile remarks, and XHTTP padding.
-
-The WebSocket fallback uses `?ed=2048` early data to reduce handshake latency.
+- `cloudflared --protocol http2` for the tunnel edge connection;
+- 1 MiB Xray per-connection buffers;
+- TCP fast-open, no-delay, and keepalive where supported;
+- random secret paths and neutral profile remarks;
+- TLS on port 443 with the Cloudflare hostname for SNI/Host.
 
 These choices make fingerprinting and casual blocking harder, but they do **not**
 make the service unblockable. `trycloudflare.com` quick-tunnel hostnames can still be
@@ -129,15 +134,16 @@ through this TLS-terminating quick-tunnel architecture.
   sets `timeout-minutes: 360`. This is not an always-on VPS and cannot run indefinitely.
 - Quick tunnels are best-effort, temporary infrastructure. Cloudflare or network
   restrictions may prevent connections; the workflow fails rather than publishing
-  an unusable configuration if public readiness cannot be verified.
+  an unusable configuration if public readiness or end-to-end verification cannot be
+  completed.
 - The exit location is the runner's outbound network, not the Cloudflare edge.
   There is no static IP, guaranteed bandwidth, or availability guarantee.
 - Use this only for lawful traffic and in accordance with GitHub's and Cloudflare's
   acceptable-use terms. Do not use it to evade platform limits or as a permanent
   proxy service. For reliable, long-running VPN hosting, use a VPS you control.
-- A public channel exposes credentials to all readers. Prefer a private channel.
-  Multi-user configs are independent credentials, but they are not private per
-  person if posted to the same shared channel.
+- A public channel exposes the shared credential to all readers. Prefer a private
+  channel. Because all users share one UUID, you cannot revoke or meter one person
+  independently without ending the run and issuing a new config.
 
 ## Security and lifecycle
 
@@ -163,7 +169,7 @@ through this TLS-terminating quick-tunnel architecture.
 
 ```text
 .github/workflows/vpn.yml   Manual GitHub Actions entry point and cleanup job
-vpn_server/config.py        Secret validation, multi-user Xray config, share links
+vpn_server/config.py        Secret validation, shared Xray config, share links
 vpn_server/install.py       Pinned binary downloads and checksum verification
 vpn_server/runtime.py       Process management, readiness, activity monitoring
 vpn_server/telegram.py      PTB config-only delivery, deletion, receipts
@@ -188,9 +194,10 @@ ruff format --check vpn_server tests
 
 The tests do not need real Telegram credentials and do not contact Telegram,
 Cloudflare, or GitHub. They cover custom PTB URLs, config-only delivery, deletion
-receipts, multi-user share links, transport encoding, the idle deadline, process
-cleanup, signal handling, checksum rejection, and workflow restrictions. A real
-end-to-end run still needs valid repository secrets and GitHub runner connectivity.
+receipts, the shared WebSocket link format, end-to-end verification wiring, the idle
+deadline, process cleanup, signal handling, checksum rejection, and workflow
+restrictions. A real end-to-end run still needs valid repository secrets and GitHub
+runner connectivity.
 
 To regenerate the hash-pinned lockfiles after changing the `.in` files:
 
@@ -215,7 +222,8 @@ PIP_ONLY_BINARY=':all:' pip-compile --generate-hashes --no-header \
   locations, but not exception text, request URLs, or local values.
 - **Tunnel startup timeout:** retry later and check whether the runner/network can
   reach Cloudflare. No Cloudflare account token is needed for this quick-tunnel mode.
-- **XHTTP does not connect on a restrictive network:** rerun with transport `ws`.
+- **End-to-end verification failed:** the workflow stops without publishing a config.
+  Retry later; the temporary tunnel or outbound network may be unavailable.
 - **Configuration delivery fails:** the job stops its children and exits unsuccessfully;
   it does not deliberately leave a VPN running without a delivered configuration.
 - **Old profile no longer connects:** start a new run and import its new configuration.
