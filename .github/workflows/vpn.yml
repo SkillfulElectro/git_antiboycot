@@ -3,20 +3,6 @@ name: Ephemeral VPN
 # Deliberately manual-only. Never expose this server on push or pull_request.
 on:
   workflow_dispatch:
-    inputs:
-      users:
-        description: Number of independent user configs (1-20)
-        required: true
-        default: '5'
-        type: string
-      transport:
-        description: XHTTP is the default; ws is a compatibility fallback
-        required: true
-        default: xhttp
-        type: choice
-        options:
-          - xhttp
-          - ws
 
 permissions:
   contents: read
@@ -53,8 +39,6 @@ jobs:
           TG_BASE_URL: ${{ secrets.TG_BASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHANNEL_USERNAME: ${{ secrets.TG_CHANNEL_USERNAME }}
-          VPN_USERS: ${{ inputs.users }}
-          VPN_TRANSPORT: ${{ inputs.transport }}
           VPN_RECEIPT_PATH: ${{ github.workspace }}/.telegram-receipt.json
         run: |
           python -m vpn_server \

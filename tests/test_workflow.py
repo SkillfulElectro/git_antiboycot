@@ -10,8 +10,7 @@ def test_manual_workflow_security_and_lifecycle():
     workflow = yaml.safe_load((ROOT / ".github/workflows/vpn.yml").read_text())
     # PyYAML implements YAML 1.1, where the unquoted key 'on' is a boolean.
     dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]
-    assert dispatch["inputs"]["users"]["default"] == "5"
-    assert dispatch["inputs"]["transport"]["options"] == ["xhttp", "ws"]
+    assert dispatch is None or dispatch == {}
     assert workflow["permissions"] == {"contents": "read"}
     assert workflow["concurrency"]["cancel-in-progress"] is False
     job = workflow["jobs"]["vpn"]
@@ -29,8 +28,8 @@ def test_manual_workflow_security_and_lifecycle():
     assert len(secret_steps) == 1
     env = secret_steps[0]["env"]
     assert {"TG_BASE_URL", "TG_BOT_TOKEN", "TG_CHANNEL_USERNAME"} <= set(env)
-    assert env["VPN_USERS"] == "${{ inputs.users }}"
-    assert env["VPN_TRANSPORT"] == "${{ inputs.transport }}"
+    assert "VPN_USERS" not in env
+    assert "VPN_TRANSPORT" not in env
     assert "python -m vpn_server" in secret_steps[0]["run"]
     assert "pull_request" not in str(workflow)
     assert any(

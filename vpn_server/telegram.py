@@ -207,26 +207,27 @@ class Notifier:
         if self.receipt_path is not None and self.chat_id is not None:
             write_receipt(self.receipt_path, self.chat_id, self.message_ids, deleted)
 
-    async def send_configs(self, links: Sequence[str]) -> None:
-        """Send one config-only message per user and persist IDs after each send."""
+    async def send_config(self, link: str) -> None:
+        """Send exactly one shared config-only message and persist its ID."""
         if self.chat_id is None:
             raise TelegramDeliveryError("Telegram notifier is not initialized.")
-        for link in links:
-            result = await self._call(
-                lambda link=link: self._raw_api(
-                    "sendMessage",
-                    {
-                        "chat_id": self.channel,
-                        "text": link,
-                        "link_preview_options": {"is_disabled": True},
-                    },
-                )
+        if self.message_ids:
+            raise TelegramDeliveryError("Only one shared config may be sent per run.")
+        result = await self._call(
+            lambda: self._raw_api(
+                "sendMessage",
+                {
+                    "chat_id": self.channel,
+                    "text": link,
+                    "link_preview_options": {"is_disabled": True},
+                },
             )
-            message_id = result.get("message_id")
-            if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
-                raise TelegramDeliveryError("Telegram sendMessage returned no valid message ID.")
-            self.message_ids.append(message_id)
-            self._persist()
+        )
+        message_id = result.get("message_id")
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+            raise TelegramDeliveryError("Telegram sendMessage returned no valid message ID.")
+        self.message_ids.append(message_id)
+        self._persist()
 
     async def delete_configs(self) -> bool:
         """Delete every tracked config message. Return True when all are gone."""

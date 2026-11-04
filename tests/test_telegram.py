@@ -17,8 +17,7 @@ from vpn_server.telegram import (
 
 TOKEN = "123456789:" + "B" * 35
 SETTINGS = TelegramSettings("https://telegram.example/proxy", TOKEN, "@private_vpn")
-LINK = "vless://test-id@private-test.trycloudflare.com:443?type=xhttp&security=tls"
-LINK2 = "vless://test-id-2@private-test.trycloudflare.com:443?type=xhttp&security=tls"
+LINK = "vless://test-id@private-test.trycloudflare.com:443?type=ws&security=tls"
 
 
 def response(result):
@@ -63,44 +62,55 @@ def install_transport(monkeypatch, handler):
     return requests
 
 
-async def test_config_only_delivery_uses_custom_base_url_and_tracks_ids(monkeypatch, tmp_path):
+async def test_config_only_delivery_uses_custom_base_url_and_tracks_id(monkeypatch, tmp_path):
     receipt_path = tmp_path / "receipt.json"
-    sent_count = 0
 
     async def handler(request):
-        nonlocal sent_count
         method = request.url.path.rsplit("/", 1)[-1]
-        if method == "sendMessage":
-            sent_count += 1
-            result = message_result(100 + sent_count)
-        else:
-            results = {
-                "getMe": bot_result(),
-                "getChat": chat_result(),
-                "getChatMember": admin_result(),
-            }
-            result = results[method]
-        return httpx.Response(200, json=response(result))
+        results = {
+            "getMe": bot_result(),
+            "getChat": chat_result(),
+            "getChatMember": admin_result(),
+            "sendMessage": message_result(101),
+        }
+        return httpx.Response(200, json=response(results[method]))
 
     requests = install_transport(monkeypatch, handler)
     async with Notifier(SETTINGS, {"VPN_RECEIPT_PATH": str(receipt_path)}) as notifier:
         assert notifier.bot.base_url == SETTINGS.api_url + TOKEN
         assert notifier.bot.base_file_url == SETTINGS.file_url + TOKEN
-        await notifier.send_configs([LINK, LINK2])
-        assert notifier.message_ids == [101, 102]
+        await notifier.send_config(LINK)
+        assert notifier.message_ids == [101]
     methods = [request.url.path.rsplit("/", 1)[-1] for request in requests]
-    assert methods == ["getMe", "getChat", "getChatMember", "sendMessage", "sendMessage"]
+    assert methods == ["getMe", "getChat", "getChatMember", "sendMessage"]
     assert all(str(request.url).startswith(SETTINGS.api_url + TOKEN + "/") for request in requests)
-    sent = [parse_qs(request.content.decode()) for request in requests[-2:]]
-    assert sent[0]["text"] == [LINK]
-    assert sent[1]["text"] == [LINK2]
-    assert all("parse_mode" not in body for body in sent)
-    assert all(json.loads(body["link_preview_options"][0])["is_disabled"] is True for body in sent)
+    sent = parse_qs(requests[-1].content.decode())
+    assert sent["text"] == [LINK]
+    assert "parse_mode" not in sent
+    assert json.loads(sent["link_preview_options"][0])["is_disabled"] is True
     receipt = read_receipt(receipt_path)
     assert receipt["chat_id"] == -1001234567890
-    assert receipt["message_ids"] == [101, 102]
+    assert receipt["message_ids"] == [101]
     assert receipt["deleted"] is False
     assert receipt_path.stat().st_mode & 0o777 == 0o600
+
+
+async def test_only_one_shared_config_can_be_sent(monkeypatch):
+    async def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        results = {
+            "getMe": bot_result(),
+            "getChat": chat_result(),
+            "getChatMember": admin_result(),
+            "sendMessage": message_result(101),
+        }
+        return httpx.Response(200, json=response(results[method]))
+
+    install_transport(monkeypatch, handler)
+    async with Notifier(SETTINGS, {}) as notifier:
+        await notifier.send_config(LINK)
+        with pytest.raises(TelegramDeliveryError, match="Only one shared config"):
+            await notifier.send_config(LINK)
 
 
 async def test_legacy_proxy_preflight_and_batch_deletion(monkeypatch, tmp_path):
@@ -123,7 +133,7 @@ async def test_legacy_proxy_preflight_and_batch_deletion(monkeypatch, tmp_path):
 
     requests = install_transport(monkeypatch, handler)
     async with Notifier(SETTINGS, {"VPN_RECEIPT_PATH": str(receipt_path)}) as notifier:
-        await notifier.send_configs([LINK])
+        await notifier.send_config(LINK)
         assert await notifier.delete_configs()
         assert notifier.message_ids == []
     assert read_receipt(receipt_path)["deleted"] is True

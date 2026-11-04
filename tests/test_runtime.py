@@ -1,10 +1,10 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from vpn_server.config import VpnConfig
+from vpn_server.config import STATS_PREFIX, VpnConfig
 from vpn_server.runtime import (
     IdleTracker,
     ManagedProcess,
@@ -13,30 +13,27 @@ from vpn_server.runtime import (
     monitor,
     parse_traffic,
     parse_tunnel_metrics,
+    probe_http_via_proxy,
     probe_websocket,
-    probe_xhttp,
+    verify_shared_config,
 )
 
 
-def make_config(users=2):
-    return VpnConfig.create((21001, 21002, 21003), users=users)
+def make_config():
+    return VpnConfig.create((21001, 21002, 21003))
 
 
-def test_parse_traffic_accepts_string_and_integer_values_for_all_users():
-    config = make_config()
-    prefixes = sorted(config.stats_prefixes)
-    assert parse_traffic("{}", config.stats_prefixes) == 0
+def test_parse_traffic_accepts_string_and_integer_values():
+    assert parse_traffic("{}") == 0
     text = json.dumps(
         {
             "stat": [
-                {"name": prefixes[0] + "uplink", "value": "10"},
-                {"name": prefixes[0] + "downlink", "value": 20},
-                {"name": prefixes[1] + "uplink", "value": "5"},
-                {"name": prefixes[1] + "downlink", "value": 7},
+                {"name": STATS_PREFIX + "uplink", "value": "10"},
+                {"name": STATS_PREFIX + "downlink", "value": 20},
             ]
         }
     )
-    assert parse_traffic(text, config.stats_prefixes) == 42
+    assert parse_traffic(text) == 30
 
 
 @pytest.mark.parametrize(
@@ -51,7 +48,7 @@ def test_parse_traffic_accepts_string_and_integer_values_for_all_users():
 )
 def test_parse_traffic_rejects_invalid_or_foreign_counters(text):
     with pytest.raises(ValueError):
-        parse_traffic(text, frozenset({"user>>>x>>>traffic>>>"}))
+        parse_traffic(text)
 
 
 def test_parse_tunnel_metrics_sums_active_http_and_tcp_sessions():
@@ -69,7 +66,7 @@ def test_parse_tunnel_metrics_rejects_missing_or_negative(text):
         parse_tunnel_metrics(text)
 
 
-def test_idle_tracker_counts_any_user_activity_and_active_streams():
+def test_idle_tracker_counts_traffic_and_active_streams():
     tracker = IdleTracker(last_activity=0, timeout=300)
     tracker.observe(now=100, traffic_bytes=0, active_streams=1)
     assert tracker.last_activity == 100
@@ -142,7 +139,7 @@ async def test_monitor_detects_dead_child():
         await monitor([process], sample, stop, poll_seconds=0.001)
 
 
-def test_probe_xhttp_sends_valid_padding_and_cors_preflight(monkeypatch):
+def test_probe_websocket_expects_101(monkeypatch):
     captured = {}
 
     class FakeConnection:
@@ -157,7 +154,7 @@ def test_probe_xhttp_sends_valid_padding_and_cors_preflight(monkeypatch):
 
         def getresponse(self):
             class Response:
-                status = 200
+                status = 101
 
             return Response()
 
@@ -165,33 +162,82 @@ def test_probe_xhttp_sends_valid_padding_and_cors_preflight(monkeypatch):
             captured["closed"] = True
 
     monkeypatch.setattr("vpn_server.runtime.HTTPSConnection", FakeConnection)
-    assert probe_xhttp("test.trycloudflare.com", "/secret")
-    assert captured["method"] == "OPTIONS"
-    assert captured["path"] == "/secret/"
-    assert captured["headers"]["Access-Control-Request-Method"] == "POST"
-    assert "x_padding=" + "X" * 256 in captured["headers"]["Referer"]
+    assert probe_websocket("test.trycloudflare.com", "/secret")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/secret"
+    assert captured["headers"]["Upgrade"] == "websocket"
     assert captured["closed"]
 
 
-def test_probe_websocket_expects_101(monkeypatch):
-    class FakeConnection:
-        def __init__(self, *args, **kwargs):
-            pass
+def test_probe_http_via_proxy_uses_connect_and_expects_204(monkeypatch):
+    captured = {}
 
-        def request(self, *args, **kwargs):
-            pass
+    class FakeResponse:
+        status = 204
+
+        def read(self):
+            return b""
+
+    class FakeConnection:
+        def __init__(self, host, port, timeout):
+            captured["proxy"] = (host, port)
+
+        def set_tunnel(self, host, port):
+            captured["tunnel"] = (host, port)
+
+        def request(self, method, path, headers):
+            captured["method"] = method
+            captured["path"] = path
+            captured["headers"] = headers
 
         def getresponse(self):
-            class Response:
-                status = 101
-
-            return Response()
+            return FakeResponse()
 
         def close(self):
-            pass
+            captured["closed"] = True
 
     monkeypatch.setattr("vpn_server.runtime.HTTPSConnection", FakeConnection)
-    assert probe_websocket("test.trycloudflare.com", "/secret")
+    assert probe_http_via_proxy(28080)
+    assert captured["proxy"] == ("127.0.0.1", 28080)
+    assert captured["tunnel"] == ("www.gstatic.com", 443)
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/generate_204"
+    assert captured["closed"]
+
+
+async def test_verify_shared_config_requires_two_simultaneous_successes(tmp_path, monkeypatch):
+    config = make_config()
+    process = FakeProcess()
+    start = AsyncMock(return_value=process)
+    wait = AsyncMock()
+    probe = Mock(side_effect=[True, True])
+    monkeypatch.setattr("vpn_server.runtime.allocate_ports", lambda count: (28080,))
+    monkeypatch.setattr("vpn_server.runtime.ManagedProcess.start", start)
+    monkeypatch.setattr("vpn_server.runtime.wait_for_origin", wait)
+    monkeypatch.setattr("vpn_server.runtime.probe_http_via_proxy", probe)
+    await verify_shared_config(tmp_path / "xray", config, "test.trycloudflare.com", tmp_path)
+    assert start.await_count == 1
+    assert wait.await_count == 1
+    assert probe.call_count == 2
+    assert process.stopped
+    client_path = tmp_path / "xray-probe-client.json"
+    assert client_path.stat().st_mode & 0o777 == 0o600
+    client = json.loads(client_path.read_text())
+    assert client["outbounds"][0]["settings"]["vnext"][0]["users"][0]["id"] == config.client_id
+
+
+async def test_verify_shared_config_fails_closed_and_stops_client(tmp_path, monkeypatch):
+    config = make_config()
+    process = FakeProcess()
+    monkeypatch.setattr("vpn_server.runtime.allocate_ports", lambda count: (28080,))
+    monkeypatch.setattr("vpn_server.runtime.ManagedProcess.start", AsyncMock(return_value=process))
+    monkeypatch.setattr("vpn_server.runtime.wait_for_origin", AsyncMock())
+    monkeypatch.setattr("vpn_server.runtime.probe_http_via_proxy", Mock(return_value=False))
+    with pytest.raises(ServerError, match="end-to-end verification"):
+        await verify_shared_config(
+            tmp_path / "xray", config, "test.trycloudflare.com", tmp_path, max_seconds=0
+        )
+    assert process.stopped
 
 
 async def test_managed_process_stop_closes_log_for_exited_child(tmp_path):
