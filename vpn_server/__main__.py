@@ -11,7 +11,15 @@ import signal
 import tempfile
 from pathlib import Path
 
-from .config import ConfigurationError, TelegramSettings, VpnConfig, share_link, xray_config
+from .config import (
+    ConfigurationError,
+    TelegramSettings,
+    VpnConfig,
+    share_link,
+    validate_transport,
+    validate_users,
+    xray_config,
+)
 from .runtime import (
     ManagedProcess,
     ServerError,
@@ -47,6 +55,8 @@ async def serve(xray: Path, cloudflared: Path) -> int:
     reason = "an operational error"
     try:
         settings = TelegramSettings.from_env()
+        users = validate_users(os.environ.get("VPN_USERS", "5"))
+        transport = validate_transport(os.environ.get("VPN_TRANSPORT", "xhttp"))
         for name, binary in {"Xray": xray, "cloudflared": cloudflared}.items():
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise ServerError(f"{name} executable is missing; run the installation step first.")
@@ -64,7 +74,7 @@ async def serve(xray: Path, cloudflared: Path) -> int:
             with tempfile.TemporaryDirectory(prefix="antiboycot-", dir=parent) as temporary:
                 directory = Path(temporary)
                 try:
-                    config = VpnConfig.create(allocate_ports())
+                    config = VpnConfig.create(allocate_ports(), users, transport)
                     config_path = directory / "xray.json"
                     fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "w") as output:
@@ -78,7 +88,7 @@ async def serve(xray: Path, cloudflared: Path) -> int:
                         )
                     )
                     await wait_for_origin(config.origin_port, processes[-1], stop)
-                    await query_traffic(xray, config.api_port)
+                    await query_traffic(xray, config.api_port, config)
                     if stop.is_set():
                         return 0
                     processes.append(
@@ -113,23 +123,30 @@ async def serve(xray: Path, cloudflared: Path) -> int:
                     host = await wait_for_tunnel(processes[-1], config, stop)
                     if stop.is_set():
                         return 0
-                    link = share_link(config, host)
+                    links = [
+                        share_link(config, host, index) for index in range(len(config.clients))
+                    ]
                     # Actions interprets these as masking commands, not log
                     # content. Do not emit credentials in local/manual runs.
                     if os.environ.get("GITHUB_ACTIONS") == "true":
-                        for secret in (config.client_id, config.ws_path, host, link):
+                        for secret in (
+                            *(client.client_id for client in config.clients),
+                            config.path,
+                            host,
+                            *links,
+                        ):
                             print(f"::add-mask::{secret}")
-                    await notifier.send_config(link)
                     delivered = True
+                    await notifier.send_configs(links)
                     print(
-                        "VPN configuration sent to Telegram. Staying alive until cancellation, "
-                        "runner shutdown, or one hour without VPN activity.",
+                        f"Sent {len(links)} config-only Telegram messages. Staying alive until "
+                        "cancellation, runner shutdown, or five minutes without VPN activity.",
                         flush=True,
                     )
 
                     async def sample():
                         return (
-                            await query_traffic(xray, config.api_port),
+                            await query_traffic(xray, config.api_port, config),
                             await query_tunnel(config.metrics_port),
                         )
 
@@ -141,8 +158,16 @@ async def serve(xray: Path, cloudflared: Path) -> int:
                 finally:
                     # Also covers startup failures, not just a successful monitor.
                     await asyncio.gather(*(process.stop() for process in processes))
-                    if delivered and not stop.is_set():
-                        await notifier.send_stopped(reason)
+                    if delivered:
+                        deleted = await notifier.delete_configs()
+                        if deleted:
+                            print("Deleted Telegram configuration messages.", flush=True)
+                        else:
+                            print(
+                                "Warning: could not delete all Telegram configuration messages; "
+                                "the independent cleanup job will retry.",
+                                flush=True,
+                            )
             print(f"VPN stopped: {reason}.", flush=True)
             return 0
     except asyncio.CancelledError:

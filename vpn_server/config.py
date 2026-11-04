@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -9,11 +10,12 @@ import uuid
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
-IDLE_TIMEOUT_SECONDS = 60 * 60
-POLL_SECONDS = 15
+IDLE_TIMEOUT_SECONDS = 5 * 60
+POLL_SECONDS = 5
 STARTUP_TIMEOUT_SECONDS = 150
-USER_EMAIL = "vpn-user"
-STATS_PREFIX = f"user>>>{USER_EMAIL}>>>traffic>>>"
+DEFAULT_USERS = 5
+MAX_USERS = 20
+TRANSPORTS = ("xhttp", "ws")
 TUNNEL_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com\Z")
 
 # Explicit rules avoid a geoip.dat dependency. Freedom's final rules also check
@@ -128,28 +130,106 @@ def validate_channel(value: str) -> str:
     return channel
 
 
+def validate_users(value: str | int) -> int:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        users = int(value)
+    except (TypeError, ValueError):
+        raise ConfigurationError("VPN_USERS must be an integer from 1 to 20.") from None
+    if not 1 <= users <= MAX_USERS:
+        raise ConfigurationError("VPN_USERS must be an integer from 1 to 20.")
+    return users
+
+
+def validate_transport(value: str) -> str:
+    value = value.strip().lower()
+    if value not in TRANSPORTS:
+        raise ConfigurationError("VPN_TRANSPORT must be xhttp or ws.")
+    return value
+
+
+@dataclass(frozen=True)
+class Client:
+    client_id: str = field(repr=False)
+    email: str
+
+    @property
+    def stats_prefix(self) -> str:
+        return f"user>>>{self.email}>>>traffic>>>"
+
+
 @dataclass(frozen=True)
 class VpnConfig:
-    client_id: str = field(repr=False)
-    ws_path: str = field(repr=False)
+    clients: tuple[Client, ...]
+    path: str = field(repr=False)
     origin_port: int
     api_port: int
     metrics_port: int
+    transport: str = "xhttp"
 
     @classmethod
-    def create(cls, ports: tuple[int, int, int]) -> VpnConfig:
+    def create(
+        cls, ports: tuple[int, int, int], users: int = DEFAULT_USERS, transport: str = "xhttp"
+    ) -> VpnConfig:
+        users = validate_users(users)
+        transport = validate_transport(transport)
         if len(set(ports)) != 3 or any(not 1 <= port <= 65535 for port in ports):
             raise ConfigurationError("Three distinct, valid loopback ports are required.")
-        return cls(str(uuid.uuid4()), "/" + secrets.token_urlsafe(24), *ports)
+        clients = tuple(Client(str(uuid.uuid4()), f"u{secrets.token_hex(8)}") for _ in range(users))
+        path = "/" + secrets.token_urlsafe(18)
+        return cls(clients, path, *ports, transport)
+
+    @property
+    def client_id(self) -> str:
+        return self.clients[0].client_id
+
+    @property
+    def ws_path(self) -> str:
+        return self.path
+
+    @property
+    def stats_prefixes(self) -> frozenset[str]:
+        return frozenset(client.stats_prefix for client in self.clients)
 
 
 def xray_config(config: VpnConfig) -> dict:
-    """Build a VLESS/WebSocket origin and a separate loopback-only stats API."""
+    """Build a multi-user VLESS origin and a separate loopback-only stats API."""
+    if config.transport == "xhttp":
+        stream = {
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": {
+                "path": config.path,
+                "mode": "auto",
+                "xPaddingBytes": "100-1000",
+                "scMaxEachPostBytes": 1000000,
+                "scMaxBufferedPosts": 30,
+            },
+        }
+    else:
+        stream = {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": config.path, "maxEarlyData": 2048},
+        }
     return {
         "log": {"loglevel": "warning"},
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
-        "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
+        "policy": {
+            "levels": {
+                "0": {
+                    "statsUserUplink": True,
+                    "statsUserDownlink": True,
+                    "handshake": 4,
+                    "connIdle": 300,
+                    "uplinkOnly": 0,
+                    "downlinkOnly": 0,
+                    "bufferSize": 1024,
+                }
+            }
+        },
         "inbounds": [
             {
                 "tag": "vpn",
@@ -157,14 +237,13 @@ def xray_config(config: VpnConfig) -> dict:
                 "port": config.origin_port,
                 "protocol": "vless",
                 "settings": {
-                    "clients": [{"id": config.client_id, "email": USER_EMAIL, "level": 0}],
+                    "clients": [
+                        {"id": client.client_id, "email": client.email, "level": 0}
+                        for client in config.clients
+                    ],
                     "decryption": "none",
                 },
-                "streamSettings": {
-                    "network": "ws",
-                    "security": "none",
-                    "wsSettings": {"path": config.ws_path},
-                },
+                "streamSettings": stream,
                 "sniffing": {"enabled": False},
             },
             {
@@ -182,6 +261,9 @@ def xray_config(config: VpnConfig) -> dict:
                 "settings": {
                     "domainStrategy": "UseIP",
                     "finalRules": [{"action": "block", "ip": list(BLOCKED_IPS)}],
+                },
+                "streamSettings": {
+                    "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True, "tcpKeepAliveInterval": 30}
                 },
             },
             {"tag": "blocked", "protocol": "blackhole"},
@@ -217,22 +299,55 @@ def validate_tunnel_host(host: str) -> str:
     return host
 
 
-def share_link(config: VpnConfig, host: str, label: str = "AntiBoycott-VPN") -> str:
+def client_extra(transport: str) -> dict:
+    if transport == "xhttp":
+        return {
+            "xPaddingBytes": "100-1000",
+            "scMaxEachPostBytes": 1000000,
+            "scMinPostsIntervalMs": "10-30",
+            "xmux": {
+                "maxConcurrency": "16-32",
+                "hMaxRequestTimes": "600-900",
+                "hMaxReusableSecs": "1800-3000",
+            },
+        }
+    return {}
+
+
+def share_link(config: VpnConfig, host: str, index: int = 0, label: str | None = None) -> str:
     host = validate_tunnel_host(host)
-    query = urlencode(
-        {
+    if not 0 <= index < len(config.clients):
+        raise ConfigurationError("Client index is out of range.")
+    client = config.clients[index]
+    if config.transport == "xhttp":
+        query = {
+            "type": "xhttp",
+            "security": "tls",
+            "encryption": "none",
+            "sni": host,
+            "host": host,
+            "path": config.path,
+            "mode": "packet-up",
+            "fp": "chrome",
+            "alpn": "h2",
+            "extra": json.dumps(client_extra("xhttp"), separators=(",", ":")),
+        }
+    else:
+        query = {
             "type": "ws",
             "security": "tls",
             "encryption": "none",
             "sni": host,
             "host": host,
-            "path": config.ws_path,
+            "path": config.path + "?ed=2048",
             "fp": "chrome",
             "alpn": "http/1.1",
-        },
-        quote_via=quote,
-    )
-    return f"vless://{config.client_id}@{host}:443?{query}#{quote(label, safe='')}"
+        }
+    encoded = urlencode(query, quote_via=quote)
+    # Neutral, non-identifying remark. The URI itself still necessarily reveals
+    # the transport/security fields required by the client.
+    fragment = quote(label if label is not None else f"node-{secrets.token_hex(3)}", safe="")
+    return f"vless://{client.client_id}@{host}:443?{encoded}#{fragment}"
 
 
 def run_url(env: dict[str, str]) -> str:
