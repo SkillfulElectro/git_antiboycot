@@ -14,8 +14,8 @@ class FakeNotifier:
     instances = []
 
     def __init__(self, settings, env):
-        self.send_config = AsyncMock()
-        self.send_stopped = AsyncMock()
+        self.send_configs = AsyncMock()
+        self.delete_configs = AsyncMock(return_value=True)
         self.instances.append(self)
 
     async def __aenter__(self):
@@ -54,6 +54,8 @@ def mocked_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("TG_BOT_TOKEN", "123456789:" + "C" * 35)
     monkeypatch.setenv("TG_CHANNEL_USERNAME", "@private_vpn")
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("VPN_USERS", "3")
+    monkeypatch.setenv("VPN_TRANSPORT", "xhttp")
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.setattr("vpn_server.__main__.Notifier", FakeNotifier)
     monkeypatch.setattr("vpn_server.__main__.ManagedProcess", FakeProcess)
@@ -64,23 +66,27 @@ def mocked_runtime(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("vpn_server.__main__.query_traffic", AsyncMock(return_value=0))
     monkeypatch.setattr(
-        "vpn_server.__main__.monitor", AsyncMock(return_value="one hour of inactivity")
+        "vpn_server.__main__.monitor", AsyncMock(return_value="five minutes of inactivity")
     )
     return tmp_path
 
 
-async def test_serve_delivers_then_cleans_up(mocked_runtime, capsys):
+async def test_serve_delivers_multi_user_configs_then_deletes_them(mocked_runtime, capsys):
     assert await serve(mocked_runtime / "xray", mocked_runtime / "cloudflared") == 0
     notifier = FakeNotifier.instances[0]
-    notifier.send_config.assert_awaited_once()
-    notifier.send_stopped.assert_awaited_once_with("one hour of inactivity")
+    notifier.send_configs.assert_awaited_once()
+    links = notifier.send_configs.await_args.args[0]
+    assert len(links) == 3
+    assert len(set(links)) == 3
+    notifier.delete_configs.assert_awaited_once()
     assert len(FakeProcess.instances) == 2
     assert all(process.stopped for process in FakeProcess.instances)
     assert list(mocked_runtime.glob("antiboycot-*")) == []
     output = capsys.readouterr().out
     assert "vless://" not in output
     assert "test.trycloudflare.com" not in output
-    assert notifier.send_config.await_args.args[0] not in output
+    assert all(link not in output for link in links)
+    assert "Deleted Telegram configuration messages" in output
 
 
 async def test_startup_failure_stops_both_processes(mocked_runtime, monkeypatch, capsys):
@@ -91,17 +97,18 @@ async def test_startup_failure_stops_both_processes(mocked_runtime, monkeypatch,
     assert len(FakeProcess.instances) == 2
     assert all(process.stopped for process in FakeProcess.instances)
     assert list(mocked_runtime.glob("antiboycot-*")) == []
-    FakeNotifier.instances[0].send_config.assert_not_awaited()
+    FakeNotifier.instances[0].send_configs.assert_not_awaited()
+    FakeNotifier.instances[0].delete_configs.assert_not_awaited()
     assert "tunnel offline" in capsys.readouterr().out
 
 
-async def test_monitor_failure_stops_children_and_sends_goodbye(mocked_runtime, monkeypatch):
+async def test_monitor_failure_stops_children_and_deletes_configs(mocked_runtime, monkeypatch):
     monkeypatch.setattr(
         "vpn_server.__main__.monitor", AsyncMock(side_effect=ServerError("health failed"))
     )
     assert await serve(mocked_runtime / "xray", mocked_runtime / "cloudflared") == 1
     assert all(process.stopped for process in FakeProcess.instances)
-    FakeNotifier.instances[0].send_stopped.assert_awaited_once_with("an operational error")
+    FakeNotifier.instances[0].delete_configs.assert_awaited_once()
     assert list(mocked_runtime.glob("antiboycot-*")) == []
 
 
@@ -112,11 +119,12 @@ async def test_delivery_failure_never_leaves_server_running(mocked_runtime, monk
 
     def failing_init(self, settings, env):
         original_init(self, settings, env)
-        self.send_config.side_effect = TelegramDeliveryError("delivery rejected")
+        self.send_configs.side_effect = TelegramDeliveryError("delivery rejected")
 
     monkeypatch.setattr(FakeNotifier, "__init__", failing_init)
     assert await serve(mocked_runtime / "xray", mocked_runtime / "cloudflared") == 1
     assert all(process.stopped for process in FakeProcess.instances)
+    FakeNotifier.instances[0].delete_configs.assert_awaited_once()
     assert list(mocked_runtime.glob("antiboycot-*")) == []
 
 
@@ -148,6 +156,7 @@ async def test_sigterm_stops_session_and_removes_config(mocked_runtime, monkeypa
     os.kill(os.getpid(), signal.SIGTERM)
     assert await asyncio.wait_for(task, 3) == 0
     assert all(process.stopped for process in FakeProcess.instances)
+    FakeNotifier.instances[0].delete_configs.assert_awaited_once()
     assert list(mocked_runtime.glob("antiboycot-*")) == []
 
 
@@ -162,4 +171,5 @@ async def test_config_file_is_private_and_removed(mocked_runtime, monkeypatch):
     assert await serve(mocked_runtime / "xray", mocked_runtime / "cloudflared") == 0
     assert captured["mode"] == 0o600
     assert captured["config"]["inbounds"][0]["listen"] == "127.0.0.1"
+    assert len(captured["config"]["inbounds"][0]["settings"]["clients"]) == 3
     assert list(mocked_runtime.glob("antiboycot-*")) == []

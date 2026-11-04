@@ -3,6 +3,20 @@ name: Ephemeral VPN
 # Deliberately manual-only. Never expose this server on push or pull_request.
 on:
   workflow_dispatch:
+    inputs:
+      users:
+        description: Number of independent user configs (1-20)
+        required: true
+        default: '5'
+        type: string
+      transport:
+        description: XHTTP is the default; ws is a compatibility fallback
+        required: true
+        default: xhttp
+        type: choice
+        options:
+          - xhttp
+          - ws
 
 permissions:
   contents: read
@@ -39,11 +53,57 @@ jobs:
           TG_BASE_URL: ${{ secrets.TG_BASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHANNEL_USERNAME: ${{ secrets.TG_CHANNEL_USERNAME }}
+          VPN_USERS: ${{ inputs.users }}
+          VPN_TRANSPORT: ${{ inputs.transport }}
+          VPN_RECEIPT_PATH: ${{ github.workspace }}/.telegram-receipt.json
         run: |
           python -m vpn_server \
             --xray "$RUNNER_TEMP/antiboycot-bin/xray" \
             --cloudflared "$RUNNER_TEMP/antiboycot-bin/cloudflared"
 
+      - name: Preserve non-secret Telegram deletion receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: telegram-receipt
+          path: .telegram-receipt.json
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
+
       - name: Remove downloaded binaries
         if: ${{ always() }}
         run: rm -rf -- "$RUNNER_TEMP/antiboycot-bin"
+
+  cleanup:
+    needs: vpn
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out workflow code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Python dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+
+      - name: Download Telegram deletion receipt
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: telegram-receipt
+          path: .
+
+      - name: Delete any remaining Telegram configuration messages
+        env:
+          TG_BASE_URL: ${{ secrets.TG_BASE_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_USERNAME: ${{ secrets.TG_CHANNEL_USERNAME }}
+        run: python -m vpn_server.cleanup --receipt .telegram-receipt.json

@@ -23,7 +23,6 @@ from .config import (
     IDLE_TIMEOUT_SECONDS,
     POLL_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
-    STATS_PREFIX,
     VpnConfig,
     validate_tunnel_host,
 )
@@ -77,13 +76,13 @@ def parse_tunnel_metrics(text: str) -> TunnelMetrics:
     )
 
 
-def parse_traffic(text: str) -> int:
+def parse_traffic(text: str, allowed_prefixes: frozenset[str]) -> int:
     # Xray's protobuf JSON can encode int64 values as either strings or numbers.
     data = json.loads(text or "{}")
     if not isinstance(data, dict):
         raise ValueError("Invalid Xray stats response.")
+    allowed = {prefix + suffix for prefix in allowed_prefixes for suffix in ("uplink", "downlink")}
     total = 0
-    allowed = {STATS_PREFIX + "uplink", STATS_PREFIX + "downlink"}
     for stat in data.get("stat", []):
         if not isinstance(stat, dict) or stat.get("name") not in allowed:
             raise ValueError("Unexpected Xray traffic counter.")
@@ -191,13 +190,13 @@ async def local_get(port: int, path: str) -> bytes:
     return await asyncio.to_thread(get)
 
 
-async def query_traffic(xray: Path, port: int) -> int:
+async def query_traffic(xray: Path, port: int, config: VpnConfig) -> int:
     process = await asyncio.create_subprocess_exec(
         str(xray),
         "api",
         "statsquery",
         f"--server=127.0.0.1:{port}",
-        f"--pattern={STATS_PREFIX}",
+        "--pattern=user>>>",
         "--reset",
         "--timeout=3",
         env=child_environment(xray.parent),
@@ -214,7 +213,7 @@ async def query_traffic(xray: Path, port: int) -> int:
     if process.returncode != 0:
         raise ServerError("Xray statistics API is unavailable.")
     try:
-        return parse_traffic(stdout.decode())
+        return parse_traffic(stdout.decode(), config.stats_prefixes)
     except (ValueError, UnicodeError):
         raise ServerError("Xray returned invalid statistics.") from None
 
@@ -241,7 +240,7 @@ async def wait_for_origin(
             return
         except OSError:
             await asyncio.sleep(0.5)
-    raise ServerError("Xray did not open its loopback WebSocket listener.")
+    raise ServerError("Xray did not open its loopback listener.")
 
 
 async def wait_for_tunnel(
@@ -256,7 +255,7 @@ async def wait_for_tunnel(
             await local_get(config.metrics_port, "/ready")
             data = json.loads(await local_get(config.metrics_port, "/quicktunnel"))
             host = validate_tunnel_host(data.get("hostname", ""))
-            if await asyncio.to_thread(probe_websocket, host, config.ws_path):
+            if await asyncio.to_thread(probe_transport, host, config):
                 return host
         except (OSError, ValueError, TypeError, AttributeError):
             pass
@@ -265,6 +264,39 @@ async def wait_for_tunnel(
         "Cloudflare quick tunnel did not become reachable within 150 seconds. "
         "Try again later; quick tunnels are best-effort and need outbound access to Cloudflare."
     )
+
+
+def probe_transport(host: str, config: VpnConfig) -> bool:
+    if config.transport == "xhttp":
+        return probe_xhttp(host, config.path)
+    return probe_websocket(host, config.path)
+
+
+def probe_xhttp(host: str, path: str) -> bool:
+    """Verify the public XHTTP route with a CORS preflight, without a credential.
+
+    Xray's XHTTP handler validates padding before answering OPTIONS. A real
+    browser preflight carries Access-Control-Request-Method and returns 200.
+    """
+    connection = HTTPSConnection(host, 443, timeout=8)
+    padding = "X" * 256
+    normalized_path = path.rstrip("/") + "/"
+    try:
+        connection.request(
+            "OPTIONS",
+            normalized_path,
+            headers={
+                "Host": host,
+                "Origin": f"https://{host}",
+                "Access-Control-Request-Method": "POST",
+                "Referer": f"https://{host}{normalized_path}?x_padding={padding}",
+            },
+        )
+        return connection.getresponse().status == 200
+    except (OSError, ValueError):
+        return False
+    finally:
+        connection.close()
 
 
 def probe_websocket(host: str, path: str) -> bool:
@@ -340,7 +372,7 @@ async def monitor(
 ) -> str:
     tracker = IdleTracker(time.monotonic(), idle_timeout)
     failures = 0
-    next_status = time.monotonic() + 300
+    next_status = time.monotonic() + 60
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
@@ -367,7 +399,9 @@ async def monitor(
         tracker.observe(now, traffic, metrics.active_streams)
         if tracker.expired(now):
             return (
-                "one hour of inactivity" if idle_timeout == 3600 else "the configured idle timeout"
+                "five minutes of inactivity"
+                if idle_timeout == 300
+                else "the configured idle timeout"
             )
         if now >= next_status:
             remaining = max(0, math.ceil(idle_timeout - (now - tracker.last_activity)))
@@ -376,5 +410,5 @@ async def monitor(
                 f"idle shutdown in at most {remaining}s.",
                 flush=True,
             )
-            next_status = now + 300
+            next_status = now + 60
     return "a stop signal (manual cancellation or runner shutdown)"

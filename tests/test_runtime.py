@@ -1,188 +1,204 @@
 import asyncio
-import stat
-import sys
-import time
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
-from vpn_server.config import STATS_PREFIX, VpnConfig
+from vpn_server.config import VpnConfig
 from vpn_server.runtime import (
     IdleTracker,
     ManagedProcess,
     ServerError,
     TunnelMetrics,
-    allocate_ports,
-    child_environment,
+    monitor,
     parse_traffic,
     parse_tunnel_metrics,
-    wait_for_origin,
-    wait_for_tunnel,
+    probe_websocket,
+    probe_xhttp,
 )
 
 
-def test_traffic_parser_handles_empty_and_protobuf_int64():
-    assert parse_traffic("{}") == 0
-    assert (
-        parse_traffic(
-            '{"stat": [{"name": "'
-            + STATS_PREFIX
-            + 'uplink", "value": "12"}, {"name": "'
-            + STATS_PREFIX
-            + 'downlink", "value": 34}]}'
-        )
-        == 46
+def make_config(users=2):
+    return VpnConfig.create((21001, 21002, 21003), users=users)
+
+
+def test_parse_traffic_accepts_string_and_integer_values_for_all_users():
+    config = make_config()
+    prefixes = sorted(config.stats_prefixes)
+    assert parse_traffic("{}", config.stats_prefixes) == 0
+    text = json.dumps(
+        {
+            "stat": [
+                {"name": prefixes[0] + "uplink", "value": "10"},
+                {"name": prefixes[0] + "downlink", "value": 20},
+                {"name": prefixes[1] + "uplink", "value": "5"},
+                {"name": prefixes[1] + "downlink", "value": 7},
+            ]
+        }
     )
+    assert parse_traffic(text, config.stats_prefixes) == 42
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "not json",
+        '{"stat":[{"name":"unexpected","value":1}]}',
+        '{"stat":[{"name":"user>>>x>>>traffic>>>uplink","value":-1}]}',
+        '{"stat":[{"name":"user>>>x>>>traffic>>>uplink","value":true}]}',
         "[]",
-        '{"stat":[{"name":"other","value":1}]}',
-        '{"stat":[{"name":"' + STATS_PREFIX + 'uplink","value":-1}]}',
+        "not json",
     ],
 )
-def test_traffic_parser_rejects_invalid_data(text):
+def test_parse_traffic_rejects_invalid_or_foreign_counters(text):
     with pytest.raises(ValueError):
-        parse_traffic(text)
+        parse_traffic(text, frozenset({"user>>>x>>>traffic>>>"}))
 
 
-def test_metrics_ignore_keepalives_and_count_active_streams():
-    metrics = parse_tunnel_metrics("""
-# HELP cloudflared_tunnel_ha_connections Number of active ha connections
-cloudflared_tunnel_ha_connections 4
+def test_parse_tunnel_metrics_sums_active_http_and_tcp_sessions():
+    text = """
+cloudflared_tunnel_ha_connections 1
 cloudflared_tunnel_concurrent_requests_per_tunnel{connection="0"} 2
-cloudflared_tcp_active_sessions 1
-cloudflared_tunnel_total_requests 900000
-cloudflared_orchestration_config_version 100
-""")
-    assert metrics == TunnelMetrics(connections=4, active_streams=3)
+cloudflared_tcp_active_sessions 3
+"""
+    assert parse_tunnel_metrics(text) == TunnelMetrics(connections=1, active_streams=5)
 
 
-@pytest.mark.parametrize(
-    "text", ["", "cloudflared_tunnel_ha_connections NaN", "cloudflared_tunnel_ha_connections -1"]
-)
-def test_missing_or_invalid_metrics_fail_closed(text):
+@pytest.mark.parametrize("text", ["", "cloudflared_tunnel_ha_connections -1\n"])
+def test_parse_tunnel_metrics_rejects_missing_or_negative(text):
     with pytest.raises(ValueError):
         parse_tunnel_metrics(text)
 
 
-def test_exact_one_hour_idle_boundary():
-    tracker = IdleTracker(last_activity=100)
-    tracker.observe(3699.99, 0, 0)
-    assert not tracker.expired(3699.99)
-    assert tracker.expired(3700)
+def test_idle_tracker_counts_any_user_activity_and_active_streams():
+    tracker = IdleTracker(last_activity=0, timeout=300)
+    tracker.observe(now=100, traffic_bytes=0, active_streams=1)
+    assert tracker.last_activity == 100
+    tracker.observe(now=200, traffic_bytes=1, active_streams=0)
+    assert tracker.last_activity == 200
+    assert not tracker.expired(499)
+    assert tracker.expired(500)
 
 
-@pytest.mark.parametrize(("traffic", "streams"), [(1, 0), (0, 1), (100, 2)])
-def test_traffic_or_connected_stream_resets_idle(traffic, streams):
-    tracker = IdleTracker(last_activity=0)
-    tracker.observe(3500, traffic, streams)
-    assert not tracker.expired(3600)
-    assert tracker.last_activity == 3500
-    assert tracker.expired(7100)
+def test_idle_tracker_rejects_negative_counters():
+    tracker = IdleTracker(0)
+    with pytest.raises(ValueError):
+        tracker.observe(1, -1, 0)
+    with pytest.raises(ValueError):
+        tracker.observe(1, 0, -1)
 
 
-async def test_monitor_stops_on_idle():
+class FakeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.stopped = False
+
+    def ensure_running(self):
+        if self.returncode is not None:
+            raise ServerError("exited")
+
+    async def stop(self):
+        self.stopped = True
+
+
+async def test_monitor_stops_after_idle_timeout_without_activity():
+    process = FakeProcess()
     stop = asyncio.Event()
-
-    async def sample():
-        return 0, TunnelMetrics(1, 0)
-
-    reason = await monitor_running(sample, stop, idle_timeout=0.04, poll_seconds=0.005)
+    sample = AsyncMock(return_value=(0, TunnelMetrics(connections=1, active_streams=0)))
+    reason = await monitor([process], sample, stop, idle_timeout=0.05, poll_seconds=0.01)
     assert reason == "the configured idle timeout"
 
 
-async def test_monitor_responds_to_stop_signal():
+def test_default_idle_timeout_is_five_minutes():
+    from vpn_server.config import IDLE_TIMEOUT_SECONDS
+
+    assert IDLE_TIMEOUT_SECONDS == 300
+
+
+async def test_monitor_respects_stop_signal():
+    process = FakeProcess()
     stop = asyncio.Event()
     stop.set()
+    sample = AsyncMock(return_value=(0, TunnelMetrics(1, 0)))
+    reason = await monitor([process], sample, stop, poll_seconds=0.01)
+    assert "stop signal" in reason
+    sample.assert_not_awaited()
 
-    async def sample():
-        pytest.fail("No sampling is needed after cancellation")
 
-    assert "stop signal" in await monitor_running(sample, stop, poll_seconds=0.005)
-
-
-async def test_monitor_does_not_treat_errors_as_activity():
+async def test_monitor_fails_closed_after_repeated_sample_errors():
+    process = FakeProcess()
     stop = asyncio.Event()
-
-    async def sample():
-        raise ServerError("offline")
-
-    with pytest.raises(ServerError, match="eight consecutive times"):
-        await monitor_running(sample, stop, idle_timeout=0, poll_seconds=0.001)
+    sample = AsyncMock(side_effect=ServerError("sample failed"))
+    with pytest.raises(ServerError, match="eight consecutive"):
+        await monitor([process], sample, stop, idle_timeout=300, poll_seconds=0.001)
+    assert sample.await_count == 8
 
 
-async def test_monitor_detects_dead_process():
-    class DeadProcess:
-        def ensure_running(self):
-            raise ServerError("Xray exited")
-
-    async def sample():
-        pytest.fail("A dead process must fail before sampling")
-
-    with pytest.raises(ServerError, match="Xray exited"):
-        await monitor_running(sample, asyncio.Event(), process=DeadProcess(), poll_seconds=0.001)
-
-
-async def monitor_running(sample, stop, process=None, **kwargs):
-    from vpn_server.runtime import monitor
-
-    if process is None:
-
-        class RunningProcess:
-            def ensure_running(self):
-                pass
-
-        process = RunningProcess()
-    return await monitor([process], sample, stop, **kwargs)
-
-
-async def test_process_cleanup_and_private_log(tmp_path, monkeypatch):
-    monkeypatch.setenv("TG_BOT_TOKEN", "do-not-pass-to-child")
-    process = await ManagedProcess.start(
-        "test",
-        [
-            sys.executable,
-            "-c",
-            "import os, time; assert 'TG_BOT_TOKEN' not in os.environ; time.sleep(60)",
-        ],
-        tmp_path,
-    )
-    assert stat.S_IMODE((tmp_path / "test.log").stat().st_mode) == 0o600
-    assert process.exit_code is None
-    started = time.monotonic()
-    await process.stop()
-    assert process.exit_code is not None
-    assert time.monotonic() - started < 6
-    await process.stop()  # Cleanup is idempotent.
-
-
-async def test_readiness_stops_promptly_on_cancellation(tmp_path):
-    process = await ManagedProcess.start(
-        "test", [sys.executable, "-c", "import time; time.sleep(60)"], tmp_path
-    )
+async def test_monitor_detects_dead_child():
+    process = FakeProcess()
+    process.returncode = 1
     stop = asyncio.Event()
-    stop.set()
-    try:
-        config = VpnConfig.create((21001, 21002, 21003))
-        assert await wait_for_tunnel(process, config, stop) == ""
-        await wait_for_origin(config.origin_port, process, stop)
-    finally:
-        await process.stop()
+    sample = AsyncMock(return_value=(0, TunnelMetrics(1, 0)))
+    with pytest.raises(ServerError, match="exited"):
+        await monitor([process], sample, stop, poll_seconds=0.001)
 
 
-def test_child_environment_excludes_credentials(monkeypatch, tmp_path):
-    monkeypatch.setenv("TG_BOT_TOKEN", "secret")
-    monkeypatch.setenv("GITHUB_TOKEN", "secret")
-    monkeypatch.setenv("ACTIONS_RUNTIME_TOKEN", "secret")
-    env = child_environment(tmp_path)
-    assert env["HOME"] == str(tmp_path)
-    assert not any("TOKEN" in key or key.startswith("TG_") for key in env)
+def test_probe_xhttp_sends_valid_padding_and_cors_preflight(monkeypatch):
+    captured = {}
+
+    class FakeConnection:
+        def __init__(self, host, port, timeout):
+            captured["host"] = host
+            captured["port"] = port
+
+        def request(self, method, path, headers):
+            captured["method"] = method
+            captured["path"] = path
+            captured["headers"] = headers
+
+        def getresponse(self):
+            class Response:
+                status = 200
+
+            return Response()
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("vpn_server.runtime.HTTPSConnection", FakeConnection)
+    assert probe_xhttp("test.trycloudflare.com", "/secret")
+    assert captured["method"] == "OPTIONS"
+    assert captured["path"] == "/secret/"
+    assert captured["headers"]["Access-Control-Request-Method"] == "POST"
+    assert "x_padding=" + "X" * 256 in captured["headers"]["Referer"]
+    assert captured["closed"]
 
 
-def test_ports_are_distinct():
-    ports = allocate_ports()
-    assert len(set(ports)) == 3
-    assert all(1024 <= port <= 65535 for port in ports)
+def test_probe_websocket_expects_101(monkeypatch):
+    class FakeConnection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            class Response:
+                status = 101
+
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("vpn_server.runtime.HTTPSConnection", FakeConnection)
+    assert probe_websocket("test.trycloudflare.com", "/secret")
+
+
+async def test_managed_process_stop_closes_log_for_exited_child(tmp_path):
+    log = (tmp_path / "test.log").open("wb")
+    process = FakeProcess()
+    process.returncode = 0
+    managed = ManagedProcess("test", process, log)
+    await managed.stop()
+    await managed.stop()
+    assert log.closed

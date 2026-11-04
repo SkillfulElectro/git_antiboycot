@@ -1,4 +1,3 @@
-import html
 import json
 from datetime import timedelta
 from unittest.mock import AsyncMock
@@ -9,11 +8,17 @@ import pytest
 from telegram.error import BadRequest, RetryAfter, TimedOut
 
 from vpn_server.config import TelegramSettings
-from vpn_server.telegram import Notifier, TelegramDeliveryError, config_message, qr_png
+from vpn_server.telegram import (
+    Notifier,
+    TelegramDeliveryError,
+    read_receipt,
+    write_receipt,
+)
 
 TOKEN = "123456789:" + "B" * 35
 SETTINGS = TelegramSettings("https://telegram.example/proxy", TOKEN, "@private_vpn")
-LINK = "vless://test-id@private-test.trycloudflare.com:443?type=ws&security=tls"
+LINK = "vless://test-id@private-test.trycloudflare.com:443?type=xhttp&security=tls"
+LINK2 = "vless://test-id-2@private-test.trycloudflare.com:443?type=xhttp&security=tls"
 
 
 def response(result):
@@ -25,138 +30,178 @@ def bot_result():
 
 
 def chat_result():
-    return {
-        "id": -1001234567890,
-        "type": "channel",
-        "title": "Private VPN",
-        "accent_color_id": 0,
-        "max_reaction_count": 11,
+    return {"id": -1001234567890, "type": "channel", "title": "Private VPN"}
+
+
+def admin_result(**overrides):
+    result = {
+        "user": bot_result(),
+        "status": "administrator",
+        "can_post_messages": True,
+        "can_delete_messages": True,
     }
+    result.update(overrides)
+    return result
 
 
-def message_result():
-    return {"message_id": 1, "date": 0, "chat": chat_result(), "text": "test"}
+def message_result(message_id=1):
+    return {"message_id": message_id, "date": 0, "chat": chat_result(), "text": "test"}
 
 
-def test_qr_is_lossless_png():
-    data = qr_png(LINK)
-    assert data.startswith(b"\x89PNG\r\n\x1a\n")
-    assert len(data) > 100
-
-
-def test_message_has_copyable_link_and_stop_instructions():
-    message = config_message(LINK, "https://github.com/owner/repo/actions/runs/1")
-    assert f"<code>{html.escape(LINK)}</code>" in message
-    assert "60 minutes" in message
-    assert "cancelled" in message
-    assert "new configuration" in message
-
-
-async def test_real_ptb_uses_custom_base_url_and_token(monkeypatch):
+def install_transport(monkeypatch, handler):
     requests = []
 
-    async def handler(request):
+    async def wrapped(request):
         requests.append(request)
-        method = request.url.path.rsplit("/", 1)[-1]
-        results = {
-            "getMe": bot_result(),
-            "getChat": chat_result(),
-            "getChatMember": {
-                "user": bot_result(),
-                "status": "administrator",
-                "can_post_messages": True,
-                **{
-                    name: True
-                    for name in (
-                        "can_be_edited",
-                        "is_anonymous",
-                        "can_manage_chat",
-                        "can_delete_messages",
-                        "can_manage_video_chats",
-                        "can_restrict_members",
-                        "can_promote_members",
-                        "can_change_info",
-                        "can_invite_users",
-                        "can_post_stories",
-                        "can_edit_stories",
-                        "can_delete_stories",
-                    )
-                },
-            },
-            "sendMessage": message_result(),
-            "sendPhoto": message_result(),
-        }
-        return httpx.Response(200, json=response(results[method]))
+        return await handler(request)
 
-    transport = httpx.MockTransport(handler)
-    real_request = httpx.AsyncClient
-
-    def client_factory(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_request(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
-    async with Notifier(SETTINGS, {}) as notifier:
-        assert notifier.bot.base_url == SETTINGS.api_url + TOKEN
-        assert notifier.bot.base_file_url == SETTINGS.file_url + TOKEN
-        await notifier.send_config(LINK)
-    assert all(str(request.url).startswith(SETTINGS.api_url + TOKEN + "/") for request in requests)
-    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
-        "getMe",  # PTB initialize() validates the bot identity.
-        "getChat",
-        "getChatMember",
-        "sendMessage",
-        "sendPhoto",
-    ]
-    sent = parse_qs(requests[-2].content.decode())
-    assert sent["chat_id"] == ["@private_vpn"]
-    assert html.escape(LINK) in sent["text"][0]
-    assert json.loads(sent["link_preview_options"][0])["is_disabled"] is True
-    assert b"\x89PNG\r\n\x1a\n" in requests[-1].content
-
-
-async def test_legacy_proxy_preflight_and_delivery(monkeypatch):
-    """Older Bot API proxies omit newer ChatFullInfo/ChatMember fields."""
-    requests = []
-
-    async def handler(request):
-        requests.append(request)
-        method = request.url.path.rsplit("/", 1)[-1]
-        results = {
-            "getMe": bot_result(),
-            "getChat": {"id": -1001234567890, "type": "channel", "title": "Private VPN"},
-            "getChatMember": {"status": "administrator", "can_post_messages": True},
-            "sendMessage": {
-                "message_id": 1,
-                "date": 0,
-                "chat": {"id": -1001234567890, "type": "channel"},
-                "text": "test",
-            },
-            "sendPhoto": {
-                "message_id": 2,
-                "date": 0,
-                "chat": {"id": -1001234567890, "type": "channel"},
-            },
-        }
-        return httpx.Response(200, json=response(results[method]))
-
-    transport = httpx.MockTransport(handler)
+    transport = httpx.MockTransport(wrapped)
     real_request = httpx.AsyncClient
     monkeypatch.setattr(
         httpx, "AsyncClient", lambda *a, **kw: real_request(*a, **{**kw, "transport": transport})
     )
+    return requests
+
+
+async def test_config_only_delivery_uses_custom_base_url_and_tracks_ids(monkeypatch, tmp_path):
+    receipt_path = tmp_path / "receipt.json"
+    sent_count = 0
+
+    async def handler(request):
+        nonlocal sent_count
+        method = request.url.path.rsplit("/", 1)[-1]
+        if method == "sendMessage":
+            sent_count += 1
+            result = message_result(100 + sent_count)
+        else:
+            results = {
+                "getMe": bot_result(),
+                "getChat": chat_result(),
+                "getChatMember": admin_result(),
+            }
+            result = results[method]
+        return httpx.Response(200, json=response(result))
+
+    requests = install_transport(monkeypatch, handler)
+    async with Notifier(SETTINGS, {"VPN_RECEIPT_PATH": str(receipt_path)}) as notifier:
+        assert notifier.bot.base_url == SETTINGS.api_url + TOKEN
+        assert notifier.bot.base_file_url == SETTINGS.file_url + TOKEN
+        await notifier.send_configs([LINK, LINK2])
+        assert notifier.message_ids == [101, 102]
+    methods = [request.url.path.rsplit("/", 1)[-1] for request in requests]
+    assert methods == ["getMe", "getChat", "getChatMember", "sendMessage", "sendMessage"]
+    assert all(str(request.url).startswith(SETTINGS.api_url + TOKEN + "/") for request in requests)
+    sent = [parse_qs(request.content.decode()) for request in requests[-2:]]
+    assert sent[0]["text"] == [LINK]
+    assert sent[1]["text"] == [LINK2]
+    assert all("parse_mode" not in body for body in sent)
+    assert all(json.loads(body["link_preview_options"][0])["is_disabled"] is True for body in sent)
+    receipt = read_receipt(receipt_path)
+    assert receipt["chat_id"] == -1001234567890
+    assert receipt["message_ids"] == [101, 102]
+    assert receipt["deleted"] is False
+    assert receipt_path.stat().st_mode & 0o777 == 0o600
+
+
+async def test_legacy_proxy_preflight_and_batch_deletion(monkeypatch, tmp_path):
+    receipt_path = tmp_path / "receipt.json"
+
+    async def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        results = {
+            "getMe": bot_result(),
+            "getChat": {"id": -1001234567890, "type": "channel"},
+            "getChatMember": {
+                "status": "administrator",
+                "can_post_messages": True,
+                "can_delete_messages": True,
+            },
+            "sendMessage": message_result(7),
+            "deleteMessages": True,
+        }
+        return httpx.Response(200, json=response(results[method]))
+
+    requests = install_transport(monkeypatch, handler)
+    async with Notifier(SETTINGS, {"VPN_RECEIPT_PATH": str(receipt_path)}) as notifier:
+        await notifier.send_configs([LINK])
+        assert await notifier.delete_configs()
+        assert notifier.message_ids == []
+    assert read_receipt(receipt_path)["deleted"] is True
+    delete_request = requests[-1]
+    assert delete_request.url.path.endswith("/deleteMessages")
+    body = parse_qs(delete_request.content.decode())
+    assert body["chat_id"] == ["-1001234567890"]
+    assert json.loads(body["message_ids"][0]) == [7]
+
+
+async def test_deletion_falls_back_to_single_messages_and_tolerates_missing(monkeypatch):
+    calls = []
+
+    async def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append(method)
+        if method == "deleteMessages":
+            return httpx.Response(
+                400, json={"ok": False, "description": "Bad Request: method not found"}
+            )
+        if method == "deleteMessage":
+            body = parse_qs(request.content.decode())
+            if body["message_id"] == ["8"]:
+                return httpx.Response(
+                    400,
+                    json={"ok": False, "description": "Bad Request: message to delete not found"},
+                )
+            return httpx.Response(200, json=response(True))
+        results = {
+            "getMe": bot_result(),
+            "getChat": chat_result(),
+            "getChatMember": admin_result(),
+        }
+        return httpx.Response(200, json=response(results[method]))
+
+    install_transport(monkeypatch, handler)
     async with Notifier(SETTINGS, {}) as notifier:
-        await notifier.send_config(LINK)
-    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
+        notifier.message_ids = [7, 8]
+        assert await notifier.delete_configs()
+    assert calls == [
         "getMe",
         "getChat",
         "getChatMember",
-        "sendMessage",
-        "sendPhoto",
+        "deleteMessages",
+        "deleteMessage",
+        "deleteMessage",
     ]
-    member_request = parse_qs(requests[2].content.decode())
-    assert member_request["chat_id"] == ["-1001234567890"]
-    assert member_request["user_id"] == ["123456789"]
+
+
+async def test_channel_post_permission_allows_own_message_deletion(monkeypatch):
+    async def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        result = (
+            admin_result(can_delete_messages=False)
+            if method == "getChatMember"
+            else (bot_result() if method == "getMe" else chat_result())
+        )
+        return httpx.Response(200, json=response(result))
+
+    install_transport(monkeypatch, handler)
+    async with Notifier(SETTINGS, {}) as notifier:
+        assert notifier.chat_id == -1001234567890
+
+
+async def test_deletion_requires_post_or_delete_permission(monkeypatch):
+    async def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        result = (
+            admin_result(can_post_messages=False, can_delete_messages=False)
+            if method == "getChatMember"
+            else (bot_result() if method == "getMe" else chat_result())
+        )
+        return httpx.Response(200, json=response(result))
+
+    install_transport(monkeypatch, handler)
+    with pytest.raises(TelegramDeliveryError, match="Post messages"):
+        async with Notifier(SETTINGS, {}):
+            pass
 
 
 async def test_invalid_raw_chat_response_is_secret_free(monkeypatch):
@@ -165,11 +210,7 @@ async def test_invalid_raw_chat_response_is_secret_free(monkeypatch):
         result = bot_result() if method == "getMe" else {"type": "channel"}
         return httpx.Response(200, json=response(result))
 
-    transport = httpx.MockTransport(handler)
-    real_request = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx, "AsyncClient", lambda *a, **kw: real_request(*a, **{**kw, "transport": transport})
-    )
+    install_transport(monkeypatch, handler)
     with pytest.raises(TelegramDeliveryError, match="invalid channel identity") as error:
         async with Notifier(SETTINGS, {}):
             pass
@@ -185,11 +226,7 @@ async def test_permission_failure_is_secret_free(monkeypatch):
             200, json=response(bot_result() if method == "getMe" else chat_result())
         )
 
-    transport = httpx.MockTransport(handler)
-    real_request = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx, "AsyncClient", lambda *a, **kw: real_request(*a, **{**kw, "transport": transport})
-    )
+    install_transport(monkeypatch, handler)
     with pytest.raises(TelegramDeliveryError, match="administrator") as error:
         async with Notifier(SETTINGS, {}):
             pass
@@ -245,3 +282,21 @@ async def test_rate_limit_is_bounded(monkeypatch):
         assert call.await_count == 1
     finally:
         await notifier.bot.shutdown()
+
+
+def test_receipt_round_trip_and_validation(tmp_path):
+    path = tmp_path / "receipt.json"
+    assert read_receipt(path) is None
+    write_receipt(path, -100, [1, 2], deleted=True)
+    assert read_receipt(path) == {
+        "version": 1,
+        "chat_id": -100,
+        "message_ids": [1, 2],
+        "deleted": True,
+    }
+    path.write_text('{"version":1,"chat_id":"x","message_ids":[],"deleted":false}')
+    with pytest.raises(TelegramDeliveryError, match="invalid"):
+        read_receipt(path)
+    path.write_text("not json")
+    with pytest.raises(TelegramDeliveryError, match="unreadable"):
+        read_receipt(path)
